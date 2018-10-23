@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -56,9 +57,18 @@ type quantReqHandler struct {
 }
 
 func (h *quantReqHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/favicon.ico" {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+
+	isMetrics := r.URL.Path == "/metrics"
+
 	// obtain master node uptime
 	uptimeResultChan := make(chan *uptimeResult)
-	go uptimeAsync(uptimeResultChan, h.kubeconfig)
+	if !isMetrics {
+		go uptimeAsync(uptimeResultChan, h.kubeconfig)
+	}
 
 	res, err := http.Get(fmt.Sprintf("http://%s:%s/metrics", metricsAddr, metricsPort))
 	if err != nil {
@@ -78,6 +88,11 @@ func (h *quantReqHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	quantifiedData := quantify(data)
 	sort.Sort(quantifiedData)
+
+	if isMetrics {
+		printPrometheusOutput(w, quantifiedData)
+		return
+	}
 
 	fmt.Fprintf(w, "[ %q ]\n", "INFO(not metrics): Master node uptime")
 
@@ -99,6 +114,15 @@ func (h *quantReqHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	for _, req := range quantifiedData {
 		fmt.Fprintf(w, "%s\n", req.String())
+	}
+}
+
+func printPrometheusOutput(w http.ResponseWriter, data ApiserverReqList) {
+	// print section headers
+	fmt.Fprintf(w, "%s\n", "# HELP quant_apiserver_request_count Counter of apiserver requests accumulated per requesting client.")
+	fmt.Fprintf(w, "%s\n", "# TYPE quant_apiserver_request_count counter")
+	for _, req := range data {
+		fmt.Fprintf(w, "quant_apiserver_request_count%s\n", (&ApiserverReqPrometheusOutput{req}).String())
 	}
 }
 
@@ -169,11 +193,19 @@ func uptimeAsync(result chan *uptimeResult, configPath string) {
 	stdout := bytes.NewBuffer(nil)
 	stderr := bytes.NewBuffer(nil)
 
+	// only attempt to perform an ssh command if hostname
+	// does not look like an ip address, and if kubeconfig
+	// is not located in a familiar location
 	cmd := exec.Command("/usr/bin/ssh", "-o", "UserKnownHostsFile=/dev/null", "-o", "StrictHostKeyChecking=no", fmt.Sprintf("%s@%s", username, hostName), "uptime", "--pretty")
+	ipMatch := regexp.MustCompile("^([0-9]+(\\.))+[0-9]+$")
+	if strings.Contains(configPath, ".minishift") || strings.Contains(configPath, ".minikube") || ipMatch.Match([]byte(hostName)) {
+		cmd = exec.Command("/usr/bin/uptime", "--pretty")
+	}
+
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	if err := cmd.Run(); err != nil {
-		result <- &uptimeResult{err: fmt.Errorf("ssh error: %v: %v", err, stderr.String())}
+		result <- &uptimeResult{err: fmt.Errorf("command exec error: %v: %v", err, stderr.String())}
 		return
 	}
 	if len(stdout.String()) > 0 {
@@ -200,6 +232,14 @@ func (r *ApiserverReq) String() string {
 	s += fmt.Sprintf("  - Resources: %v\n", r.resources)
 	s += fmt.Sprintf("  - Verbs: %v\n", r.verbs)
 	return s
+}
+
+type ApiserverReqPrometheusOutput struct {
+	req *ApiserverReq
+}
+
+func (r *ApiserverReqPrometheusOutput) String() string {
+	return fmt.Sprintf("{client=%q} %d", r.req.clientName, r.req.totalReqCount)
 }
 
 type ApiserverReqList []*ApiserverReq
@@ -288,7 +328,7 @@ func parseLine(line string) (*ApiserverReq, error) {
 			continue
 		}
 		key := segs[0]
-		val := segs[1]
+		val := stripQuotes(segs[1])
 		switch key {
 		case "client":
 			req.clientName = val
@@ -300,6 +340,20 @@ func parseLine(line string) (*ApiserverReq, error) {
 	}
 
 	return req, nil
+}
+
+func stripQuotes(val string) string {
+	if len(val) == 0 {
+		return val
+	}
+	str := val
+	if str[0] == '"' {
+		str = str[1:]
+	}
+	if str[len(str)-1] == '"' {
+		str = str[:len(str)-1]
+	}
+	return str
 }
 
 func main() {
